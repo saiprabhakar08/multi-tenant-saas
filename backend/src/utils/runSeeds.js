@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const { pool } = require('../config/db');
 
-const runSeeds = async () => {
+const run = async () => {
   const seedSQL = fs.readFileSync(
     path.join(__dirname, '../../seeds/seed_data.sql'),
     'utf8'
@@ -10,4 +10,4 @@ const runSeeds = async () => {
   await pool.query(seedSQL);
 };
 
-module.exports = runSeeds;
+module.exports = { run };

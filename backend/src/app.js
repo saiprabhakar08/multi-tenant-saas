@@ -2,8 +2,8 @@ const express = require('express');
 const cors = require('cors');
 require('dotenv').config();
 const { checkDbConnection } = require('./config/db');
-const runMigrations = require('./utils/runMigrations');
-const runSeeds = require('./utils/runSeeds');
+const { run: runMigrations } = require('./utils/runMigrations');
+const { run: runSeeds } = require('./utils/runSeeds');
 const { sendSuccess, sendError } = require('./utils/responseHelper');
 
 const app = express();
@@ -37,12 +37,15 @@ app.get('/api/health', async (req, res) => {
 
 (async () => {
   try {
-    // await runMigrations(); // Skip migrations for now
-    // await runSeeds(); // Skip seeds for now  
-    console.log('Skipping migrations & seeds for initial startup');
+    console.log('Starting database initialization...');
+    await runMigrations();
+    console.log('Migrations completed successfully');
+    await runSeeds();
+    console.log('Seeds completed successfully');
+    console.log('Database initialization completed successfully');
   } catch (err) {
     console.error('DB init failed:', err);
-    process.exit(1);
+    // Don't exit, let the server start anyway
   }
 })();
 
