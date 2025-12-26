@@ -23,6 +23,7 @@ const run = async () => {
         const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
         // Extract only the UP migration (before -- DOWN comment)
         const upSql = sql.split('-- DOWN')[0].replace(/-- UP\s*\n?/, '').trim();
+        console.log(`Executing SQL: ${upSql.substring(0, 100)}...`);
         if (upSql) {
           await pool.query(upSql);
         }
