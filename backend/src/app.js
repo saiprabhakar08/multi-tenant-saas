@@ -37,9 +37,9 @@ app.get('/api/health', async (req, res) => {
 
 (async () => {
   try {
-    await runMigrations();
-    await runSeeds();
-    console.log('Migrations & seeds completed');
+    // await runMigrations(); // Skip migrations for now
+    // await runSeeds(); // Skip seeds for now  
+    console.log('Skipping migrations & seeds for initial startup');
   } catch (err) {
     console.error('DB init failed:', err);
     process.exit(1);
