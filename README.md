@@ -125,21 +125,7 @@ The system comes pre-seeded with demonstration accounts:
 - **Tasks**: `/api/tasks/*`
 - **Health Check**: `/api/health`
 
-## 📹 Demo Video
-
-Watch the complete system demonstration and walkthrough:
-
-**[Multi-Tenant SaaS Demo Video](https://youtube.com/placeholder)**
-
-The demo video covers:
-- System overview and architecture
-- User authentication and role management
-- Tenant administration features
-- Project and task management
-- Multi-tenant data isolation demonstration
-- Health monitoring and system status
-
-## 🔧 Development
+##  Development
 
 ### Project Structure
 ```
@@ -175,4 +161,4 @@ This project is created for educational and demonstration purposes.
 
 ---
 
-For questions or support, please refer to the demo video or check the health endpoint status.
+For questions or support, please check the health endpoint status.

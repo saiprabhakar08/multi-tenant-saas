@@ -86,6 +86,27 @@ export default function ProjectDetails() {
     }
   };
 
+  const getTaskStatusBadgeStyle = (status) => {
+    const baseStyle = {
+      padding: '4px 8px',
+      borderRadius: '12px',
+      fontSize: '11px',
+      fontWeight: 'bold',
+      textTransform: 'uppercase'
+    };
+
+    switch (status) {
+      case 'todo':
+        return { ...baseStyle, backgroundColor: '#e9ecef', color: '#495057' };
+      case 'in_progress':
+        return { ...baseStyle, backgroundColor: '#fff3cd', color: '#856404' };
+      case 'completed':
+        return { ...baseStyle, backgroundColor: '#d4edda', color: '#155724' };
+      default:
+        return { ...baseStyle, backgroundColor: '#f8d7da', color: '#721c24' };
+    }
+  };
+
   const getTaskPriorityBadgeStyle = (priority) => {
     const baseStyle = {
       padding: '4px 8px',
