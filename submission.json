@@ -1,0 +1,26 @@
+{
+  "seedCredentials": {
+    "superAdmin": {
+      "email": "superadmin@system.com",
+      "password": "Admin@123",
+      "tenantId": null
+    },
+    "tenantAdmin": {
+      "email": "admin@demo.com",
+      "password": "Demo@123",
+      "tenantId": "demo"
+    },
+    "users": [
+      {
+        "email": "user1@demo.com",
+        "password": "User@123",
+        "tenantId": "demo"
+      },
+      {
+        "email": "user2@demo.com",
+        "password": "User@123",
+        "tenantId": "demo"
+      }
+    ]
+  }
+}
