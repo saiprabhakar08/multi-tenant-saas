@@ -1,6 +1,6 @@
 const { pool } = require('../config/db');
 const bcrypt = require('bcrypt');
-const { v4: uuidv4 } = require('uuid');
+const { randomUUID } = require('crypto');
 const logAudit = require('../utils/auditLogger');
 const { sendSuccess, sendError } = require('../utils/responseHelper');
 
@@ -66,7 +66,7 @@ const addUser = async (req, res) => {
 
     // Hash password
     const passwordHash = await bcrypt.hash(password, 10);
-    const newUserId = uuidv4();
+    const newUserId = randomUUID();
 
     // Create user
     const result = await client.query(

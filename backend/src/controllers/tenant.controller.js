@@ -1,5 +1,5 @@
 const { pool } = require('../config/db');
-const { v4: uuidv4 } = require('uuid');
+const { randomUUID } = require('crypto');
 const logAudit = require('../utils/auditLogger');
 const { sendSuccess, sendError } = require('../utils/responseHelper');
 

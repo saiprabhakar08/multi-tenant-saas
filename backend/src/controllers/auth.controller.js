@@ -1,7 +1,7 @@
 const bcrypt = require('bcrypt');
 const { pool } = require('../config/db');
 const { generateToken } = require('../utils/jwt');
-const { v4: uuidv4 } = require('uuid');
+const { randomUUID } = require('crypto');
 const logAudit = require('../utils/auditLogger');
 const { sendSuccess, sendError } = require('../utils/responseHelper');
 
@@ -17,7 +17,7 @@ const registerTenant = async (req, res) => {
     const passwordHash = await bcrypt.hash(adminPassword, 10);
     
     // Create tenant
-    const tenantId = uuidv4();
+    const tenantId = randomUUID();
     await client.query(
       `INSERT INTO tenants (id, name, subdomain, max_users, max_projects) 
        VALUES ($1, $2, $3, $4, $5)`,
@@ -25,7 +25,7 @@ const registerTenant = async (req, res) => {
     );
     
     // Create tenant admin
-    const userId = uuidv4();
+    const userId = randomUUID();
     await client.query(
       `INSERT INTO users (id, tenant_id, email, password_hash, full_name, role) 
        VALUES ($1, $2, $3, $4, $5, $6)`,
