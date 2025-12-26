@@ -12,6 +12,18 @@ const run = async () => {
   });
 
   try {
+    // Check if migrations have already been run
+    const checkResult = await pool.query(`
+      SELECT table_name 
+      FROM information_schema.tables 
+      WHERE table_schema = 'public' AND table_name = 'tenants'
+    `);
+    
+    if (checkResult.rows.length > 0) {
+      console.log('Database already initialized, skipping migrations');
+      return;
+    }
+
     // Read all migration files
     const migrationsDir = path.join(__dirname, '../../migrations');
     const files = fs.readdirSync(migrationsDir).sort();
