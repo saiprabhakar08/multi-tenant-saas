@@ -4,7 +4,11 @@ const path = require('path');
 
 const run = async () => {
   const pool = new Pool({
-    connectionString: process.env.DATABASE_URL || 'postgres://postgres:password@database:5432/saas_db'
+    host: process.env.DB_HOST,
+    port: process.env.DB_PORT,
+    database: process.env.DB_NAME,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD
   });
 
   try {
