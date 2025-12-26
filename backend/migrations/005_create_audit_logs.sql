@@ -1,5 +1,5 @@
 -- UP
-CREATE TABLE audit_logs (
+CREATE TABLE IF NOT EXISTS audit_logs (
   id UUID PRIMARY KEY,
   tenant_id UUID NULL,
   user_id UUID NULL,
