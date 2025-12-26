@@ -1,18 +1,7 @@
 const { pool } = require('../config/db');
 const { v4: uuidv4 } = require('uuid');
-
-// Helper function to log updates to audit_logs
-const logAuditEvent = async (client, userId, tenantId, action, entityType, entityId, ipAddress) => {
-  try {
-    await client.query(
-      `INSERT INTO audit_logs (id, tenant_id, user_id, action, entity_type, entity_id, ip_address) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [uuidv4(), tenantId, userId, action, entityType, entityId, ipAddress]
-    );
-  } catch (error) {
-    console.error('Failed to log audit event:', error);
-  }
-};
+const logAudit = require('../utils/auditLogger');
+const { sendSuccess, sendError } = require('../utils/responseHelper');
 
 // Helper function to calculate tenant stats
 const calculateTenantStats = async (client, tenantId) => {
@@ -36,44 +25,35 @@ const getTenantById = async (req, res) => {
 
     // Enforce Tenant Isolation: If role !== super_admin, ensure req.user.tenantId === req.params.tenantId
     if (role !== 'super_admin' && tenantId !== id) {
-      return res.status(403).json({
-        success: false,
-        message: 'Access denied: Cannot view other tenants'
-      });
+      return sendError(res, 403, 'Access denied: Cannot view other tenants');
     }
 
     const client = await pool.connect();
-    
+
     try {
-      const query = `
-        SELECT id, name, subdomain, status, subscription_plan, 
-               max_users, max_projects, created_at, updated_at
-        FROM tenants 
-        WHERE id = $1
-      `;
+      // Get tenant info
+      const tenantResult = await client.query(
+        'SELECT id, name, status, subscription_type, max_users, max_projects, created_at FROM tenants WHERE id = $1',
+        [id]
+      );
 
-      const result = await client.query(query, [id]);
-
-      if (result.rows.length === 0) {
-        return res.status(404).json({
-          success: false,
-          message: 'Tenant not found'
-        });
+      if (tenantResult.rows.length === 0) {
+        return sendError(res, 404, 'Tenant not found');
       }
+
+      const tenant = tenantResult.rows[0];
 
       // Calculate tenant stats
       const stats = await calculateTenantStats(client, id);
-      
-      // Log audit event
-      await logAuditEvent(
-        client, userId, tenantId, 'view_tenant', 'tenant', id, 
-        req.ip || req.connection.remoteAddress
-      );
 
-      res.status(200).json({
-        success: true,
-        data: {
-          ...result.rows[0],
+      // Log audit trail
+      await logAudit(id, userId, 'READ', 'tenant', id, {
+        accessedBy: role
+      });
+
+      return sendSuccess(res, 200, {
+        tenant: {
+          ...tenant,
           stats
         }
       });
@@ -83,11 +63,8 @@ const getTenantById = async (req, res) => {
     }
 
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Failed to get tenant',
-      error: error.message
-    });
+    console.error('Get tenant error:', error);
+    return sendError(res, 500, 'Internal server error');
   }
 };
 
@@ -99,110 +76,116 @@ const updateTenant = async (req, res) => {
     
     const { id } = req.params;
     const { role, tenantId, userId } = req.user;
-    const { name, status, subscriptionPlan, maxUsers, maxProjects } = req.body;
+    const { name, status, subscriptionType, maxUsers, maxProjects } = req.body;
 
-    // Enforce Tenant Isolation: If role !== super_admin, ensure req.user.tenantId === req.params.tenantId
-    if (role !== 'super_admin' && tenantId !== id) {
-      return res.status(403).json({
-        success: false,
-        message: 'Access denied: Cannot update other tenants'
-      });
+    // BUSINESS RULE: Only super_admin can update tenants
+    if (role !== 'super_admin') {
+      return sendError(res, 403, 'Access denied: Only super administrators can update tenants');
     }
 
-    // ❌ BUSINESS RULES: tenant_admin cannot update restricted fields
-    if (role === 'tenant_admin' && (status || subscriptionPlan || maxUsers || maxProjects)) {
-      return res.status(403).json({
-        success: false,
-        message: 'Access denied: tenant_admin cannot modify subscriptionPlan, status, maxUsers, or maxProjects'
-      });
+    // Enforce Tenant Isolation (even super_admin should use correct tenant ID)
+    if (tenantId !== id) {
+      return sendError(res, 403, 'Access denied: Tenant ID mismatch');
     }
 
+    // Get current tenant to verify it exists
+    const currentTenant = await client.query(
+      'SELECT id, name, max_users, max_projects FROM tenants WHERE id = $1',
+      [id]
+    );
+
+    if (currentTenant.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return sendError(res, 404, 'Tenant not found');
+    }
+
+    const tenant = currentTenant.rows[0];
+
+    // If reducing limits, check current usage
+    if (maxUsers && maxUsers < tenant.max_users) {
+      const userCount = await client.query(
+        'SELECT COUNT(*) as count FROM users WHERE tenant_id = $1 AND is_active = true',
+        [id]
+      );
+      
+      if (parseInt(userCount.rows[0].count) > maxUsers) {
+        await client.query('ROLLBACK');
+        return sendError(res, 400, `Cannot reduce user limit: Current usage (${userCount.rows[0].count}) exceeds new limit (${maxUsers})`);
+      }
+    }
+
+    if (maxProjects && maxProjects < tenant.max_projects) {
+      const projectCount = await client.query(
+        'SELECT COUNT(*) as count FROM projects WHERE tenant_id = $1',
+        [id]
+      );
+      
+      if (parseInt(projectCount.rows[0].count) > maxProjects) {
+        await client.query('ROLLBACK');
+        return sendError(res, 400, `Cannot reduce project limit: Current usage (${projectCount.rows[0].count}) exceeds new limit (${maxProjects})`);
+      }
+    }
+
+    // Build update query dynamically
     const updates = [];
     const values = [];
     let paramCount = 1;
 
-    if (name) {
+    if (name !== undefined) {
       updates.push(`name = $${paramCount++}`);
       values.push(name);
     }
 
-    // ✅ Only super_admin can update these fields
-    if (role === 'super_admin') {
-      if (status) {
-        updates.push(`status = $${paramCount++}`);
-        values.push(status);
-      }
-      if (subscriptionPlan) {
-        updates.push(`subscription_plan = $${paramCount++}`);
-        values.push(subscriptionPlan);
-      }
-      if (maxUsers) {
-        updates.push(`max_users = $${paramCount++}`);
-        values.push(maxUsers);
-      }
-      if (maxProjects) {
-        updates.push(`max_projects = $${paramCount++}`);
-        values.push(maxProjects);
-      }
+    if (status !== undefined) {
+      updates.push(`status = $${paramCount++}`);
+      values.push(status);
+    }
+
+    if (subscriptionType !== undefined) {
+      updates.push(`subscription_type = $${paramCount++}`);
+      values.push(subscriptionType);
+    }
+
+    if (maxUsers !== undefined) {
+      updates.push(`max_users = $${paramCount++}`);
+      values.push(maxUsers);
+    }
+
+    if (maxProjects !== undefined) {
+      updates.push(`max_projects = $${paramCount++}`);
+      values.push(maxProjects);
     }
 
     if (updates.length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: 'No valid fields to update'
-      });
+      await client.query('ROLLBACK');
+      return sendError(res, 400, 'No valid fields to update');
     }
 
-    updates.push(`updated_at = $${paramCount++}`);
-    values.push(new Date());
+    updates.push(`updated_at = NOW()`);
     values.push(id);
 
-    const query = `
-      UPDATE tenants 
-      SET ${updates.join(', ')} 
-      WHERE id = $${paramCount}
-      RETURNING id, name, subdomain, status, subscription_plan, 
-                max_users, max_projects, created_at, updated_at
-    `;
-
-    const result = await client.query(query, values);
-
-    if (result.rows.length === 0) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({
-        success: false,
-        message: 'Tenant not found'
-      });
-    }
-
-    // Calculate updated stats
-    const stats = await calculateTenantStats(client, id);
-
-    // Always log updates to audit_logs
-    const updateDetails = Object.keys(req.body).join(', ');
-    await logAuditEvent(
-      client, userId, tenantId, `update_tenant: ${updateDetails}`, 'tenant', id,
-      req.ip || req.connection.remoteAddress
+    const result = await client.query(
+      `UPDATE tenants SET ${updates.join(', ')} 
+       WHERE id = $${paramCount} 
+       RETURNING id, name, status, subscription_type, max_users, max_projects, created_at, updated_at`,
+      values
     );
+
+    // Log audit trail
+    await logAudit(id, userId, 'UPDATE', 'tenant', id, {
+      updatedFields: { name, status, subscriptionType, maxUsers, maxProjects }
+    });
 
     await client.query('COMMIT');
 
-    res.status(200).json({
-      success: true,
-      message: 'Tenant updated successfully',
-      data: {
-        ...result.rows[0],
-        stats
-      }
-    });
+    return sendSuccess(res, 200, {
+      tenant: result.rows[0]
+    }, 'Tenant updated successfully');
 
   } catch (error) {
     await client.query('ROLLBACK');
-    res.status(500).json({
-      success: false,
-      message: 'Failed to update tenant',
-      error: error.message
-    });
+    console.error('Update tenant error:', error);
+    return sendError(res, 500, 'Internal server error');
   } finally {
     client.release();
   }
@@ -212,82 +195,68 @@ const listTenants = async (req, res) => {
   try {
     const { role, tenantId, userId } = req.user;
 
+    // BUSINESS RULE: Only super_admin can list all tenants
+    if (role !== 'super_admin') {
+      // Non-super admin can only see their own tenant
+      const client = await pool.connect();
+      
+      try {
+        const tenantResult = await client.query(
+          'SELECT id, name, status, subscription_type, max_users, max_projects, created_at FROM tenants WHERE id = $1',
+          [tenantId]
+        );
+
+        if (tenantResult.rows.length === 0) {
+          return sendError(res, 403, 'Access denied: Tenant not found');
+        }
+
+        const tenant = tenantResult.rows[0];
+        const stats = await calculateTenantStats(client, tenantId);
+
+        return sendSuccess(res, 200, {
+          tenants: [{
+            ...tenant,
+            stats
+          }],
+          count: 1
+        });
+
+      } finally {
+        client.release();
+      }
+    }
+
+    // Super admin can see all tenants
     const client = await pool.connect();
     
     try {
-      let query;
-      let values = [];
-      let tenantsData = [];
-
-      if (role === 'super_admin') {
-        // super_admin can see all tenants
-        query = `
-          SELECT id, name, subdomain, status, subscription_plan, 
-                 max_users, max_projects, created_at, updated_at
-          FROM tenants 
-          ORDER BY created_at DESC
-        `;
-        
-        const result = await client.query(query);
-        
-        // Calculate stats for each tenant
-        for (const tenant of result.rows) {
-          const stats = await calculateTenantStats(client, tenant.id);
-          tenantsData.push({
-            ...tenant,
-            stats
-          });
-        }
-        
-      } else if (role === 'tenant_admin') {
-        // tenant_admin can only see their own tenant
-        query = `
-          SELECT id, name, subdomain, status, subscription_plan, 
-                 max_users, max_projects, created_at, updated_at
-          FROM tenants 
-          WHERE id = $1
-        `;
-        values = [tenantId];
-        
-        const result = await client.query(query, values);
-        
-        if (result.rows.length > 0) {
-          const stats = await calculateTenantStats(client, result.rows[0].id);
-          tenantsData.push({
-            ...result.rows[0],
-            stats
-          });
-        }
-        
-      } else {
-        return res.status(403).json({
-          success: false,
-          message: 'Access denied: Insufficient permissions'
-        });
-      }
-
-      // Log audit event
-      await logAuditEvent(
-        client, userId, tenantId, 'list_tenants', 'tenant', null,
-        req.ip || req.connection.remoteAddress
+      const result = await client.query(
+        'SELECT id, name, status, subscription_type, max_users, max_projects, created_at FROM tenants ORDER BY created_at DESC'
       );
 
-      res.status(200).json({
-        success: true,
-        data: tenantsData,
-        count: tenantsData.length
+      // Get stats for each tenant
+      const tenantsWithStats = await Promise.all(
+        result.rows.map(async (tenant) => {
+          const stats = await calculateTenantStats(client, tenant.id);
+          return {
+            ...tenant,
+            stats
+          };
+        })
+      );
+
+      return sendSuccess(res, 200, {
+        tenants: tenantsWithStats,
+        count: tenantsWithStats.length
       });
-      
+
     } finally {
       client.release();
     }
 
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Failed to list tenants',
-      error: error.message
-    });
+    console.error('List tenants error:', error);
+    return sendError(res, 500, 'Internal server error');
   }
 };
 

@@ -1,18 +1,7 @@
 const { pool } = require('../config/db');
 const { v4: uuidv4 } = require('uuid');
-
-// Helper function to log updates to audit_logs
-const logAuditEvent = async (client, userId, tenantId, action, entityType, entityId, ipAddress) => {
-  try {
-    await client.query(
-      `INSERT INTO audit_logs (id, tenant_id, user_id, action, entity_type, entity_id, ip_address) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [uuidv4(), tenantId, userId, action, entityType, entityId, ipAddress]
-    );
-  } catch (error) {
-    console.error('Failed to log audit event:', error);
-  }
-};
+const logAudit = require('../utils/auditLogger');
+const { sendSuccess, sendError } = require('../utils/responseHelper');
 
 const createProject = async (req, res) => {
   const client = await pool.connect();
@@ -27,10 +16,7 @@ const createProject = async (req, res) => {
     // Basic validation
     if (!name || name.trim() === '') {
       await client.query('ROLLBACK');
-      return res.status(400).json({
-        success: false,
-        message: 'Project name is required'
-      });
+      return sendError(res, 400, 'Project name is required');
     }
 
     // BUSINESS RULE: Check max_projects before creating project
@@ -41,10 +27,7 @@ const createProject = async (req, res) => {
 
     if (tenantQuery.rows.length === 0) {
       await client.query('ROLLBACK');
-      return res.status(404).json({
-        success: false,
-        message: 'Tenant not found'
-      });
+      return sendError(res, 404, 'Tenant not found');
     }
 
     const maxProjects = tenantQuery.rows[0].max_projects;
@@ -59,10 +42,7 @@ const createProject = async (req, res) => {
 
     if (currentProjectCount >= maxProjects) {
       await client.query('ROLLBACK');
-      return res.status(400).json({
-        success: false,
-        message: `Cannot create project: Limit reached (${maxProjects} projects maximum)`
-      });
+      return sendError(res, 400, `Cannot create project: Limit reached (${maxProjects} projects maximum)`);
     }
 
     // Check if project name already exists in this tenant
@@ -73,10 +53,7 @@ const createProject = async (req, res) => {
 
     if (existingProject.rows.length > 0) {
       await client.query('ROLLBACK');
-      return res.status(409).json({
-        success: false,
-        message: 'Project name already exists in this tenant'
-      });
+      return sendError(res, 409, 'Project name already exists in this tenant');
     }
 
     const projectId = uuidv4();
@@ -89,27 +66,23 @@ const createProject = async (req, res) => {
       [projectId, tenantId, name.trim(), description, priority, status, userId]
     );
 
-    // BUSINESS RULE: Log all actions in audit_logs
-    await logAuditEvent(
-      client, userId, tenantId, 'create_project', 'project', projectId,
-      req.ip || req.connection.remoteAddress
-    );
+    // Log audit trail
+    await logAudit(tenantId, userId, 'CREATE', 'project', projectId, {
+      projectName: name.trim(),
+      priority,
+      status
+    });
 
     await client.query('COMMIT');
 
-    res.status(201).json({
-      success: true,
-      message: 'Project created successfully',
-      data: result.rows[0]
-    });
+    return sendSuccess(res, 201, {
+      project: result.rows[0]
+    }, 'Project created successfully');
 
   } catch (error) {
     await client.query('ROLLBACK');
-    res.status(500).json({
-      success: false,
-      message: 'Failed to create project',
-      error: error.message
-    });
+    console.error('Create project error:', error);
+    return sendError(res, 500, 'Failed to create project');
   } finally {
     client.release();
   }
@@ -206,15 +179,14 @@ const listProjects = async (req, res) => {
 
       const result = await client.query(query, values);
 
-      // BUSINESS RULE: Log all actions in audit_logs
-      await logAuditEvent(
-        client, userId, tenantId, 'list_projects', 'project', null,
-        req.ip || req.connection.remoteAddress
-      );
+      // Log audit trail
+      await logAudit(tenantId, userId, 'READ', 'project_list', null, {
+        filters: { status, priority, createdBy, search },
+        projectCount: result.rows.length
+      });
 
-      res.status(200).json({
-        success: true,
-        data: result.rows,
+      return sendSuccess(res, 200, {
+        projects: result.rows,
         pagination: {
           currentPage: pageNum,
           totalPages: totalPages,
@@ -236,11 +208,8 @@ const listProjects = async (req, res) => {
     }
 
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Failed to list projects',
-      error: error.message
-    });
+    console.error('List projects error:', error);
+    return sendError(res, 500, 'Failed to list projects');
   }
 };
 
@@ -264,10 +233,7 @@ const updateProject = async (req, res) => {
 
     if (projectQuery.rows.length === 0) {
       await client.query('ROLLBACK');
-      return res.status(404).json({
-        success: false,
-        message: 'Project not found'
-      });
+      return sendError(res, 404, 'Project not found');
     }
 
     const project = projectQuery.rows[0];
@@ -275,10 +241,7 @@ const updateProject = async (req, res) => {
     // BUSINESS RULE: Authorization - tenant_admin → full access, Project creator → can update/delete own project
     if (role !== 'tenant_admin' && project.created_by !== userId) {
       await client.query('ROLLBACK');
-      return res.status(403).json({
-        success: false,
-        message: 'Access denied: Only project creator or tenant administrator can update projects'
-      });
+      return sendError(res, 403, 'Access denied: Only project creator or tenant administrator can update projects');
     }
 
     // If updating name, check for duplicates within tenant
@@ -290,10 +253,7 @@ const updateProject = async (req, res) => {
 
       if (existingProject.rows.length > 0) {
         await client.query('ROLLBACK');
-        return res.status(409).json({
-          success: false,
-          message: 'Project name already exists in this tenant'
-        });
+        return sendError(res, 409, 'Project name already exists in this tenant');
       }
     }
 
@@ -323,10 +283,7 @@ const updateProject = async (req, res) => {
 
     if (updates.length === 0) {
       await client.query('ROLLBACK');
-      return res.status(400).json({
-        success: false,
-        message: 'No valid fields to update'
-      });
+      return sendError(res, 400, 'No valid fields to update');
     }
 
     updates.push(`updated_at = $${paramCount++}`);
@@ -344,28 +301,21 @@ const updateProject = async (req, res) => {
 
     const result = await client.query(query, values);
 
-    // BUSINESS RULE: Log all actions in audit_logs
-    const updateDetails = Object.keys(req.body).join(', ');
-    await logAuditEvent(
-      client, userId, tenantId, `update_project: ${updateDetails}`, 'project', projectId,
-      req.ip || req.connection.remoteAddress
-    );
+    // Log audit trail
+    await logAudit(tenantId, userId, 'UPDATE', 'project', projectId, {
+      updatedFields: { name, description, priority, status }
+    });
 
     await client.query('COMMIT');
 
-    res.status(200).json({
-      success: true,
-      message: 'Project updated successfully',
-      data: result.rows[0]
-    });
+    return sendSuccess(res, 200, {
+      project: result.rows[0]
+    }, 'Project updated successfully');
 
   } catch (error) {
     await client.query('ROLLBACK');
-    res.status(500).json({
-      success: false,
-      message: 'Failed to update project',
-      error: error.message
-    });
+    console.error('Update project error:', error);
+    return sendError(res, 500, 'Failed to update project');
   } finally {
     client.release();
   }
@@ -390,10 +340,7 @@ const deleteProject = async (req, res) => {
 
     if (projectQuery.rows.length === 0) {
       await client.query('ROLLBACK');
-      return res.status(404).json({
-        success: false,
-        message: 'Project not found'
-      });
+      return sendError(res, 404, 'Project not found');
     }
 
     const project = projectQuery.rows[0];
@@ -401,10 +348,7 @@ const deleteProject = async (req, res) => {
     // BUSINESS RULE: Authorization - tenant_admin → full access, Project creator → can update/delete own project
     if (role !== 'tenant_admin' && project.created_by !== userId) {
       await client.query('ROLLBACK');
-      return res.status(403).json({
-        success: false,
-        message: 'Access denied: Only project creator or tenant administrator can delete projects'
-      });
+      return sendError(res, 403, 'Access denied: Only project creator or tenant administrator can delete projects');
     }
 
     // Check if project has tasks
@@ -415,10 +359,7 @@ const deleteProject = async (req, res) => {
 
     if (parseInt(taskCount.rows[0].count) > 0) {
       await client.query('ROLLBACK');
-      return res.status(400).json({
-        success: false,
-        message: 'Cannot delete project with existing tasks. Please delete all tasks first.'
-      });
+      return sendError(res, 400, 'Cannot delete project with existing tasks. Please delete all tasks first.');
     }
 
     // Delete project (ensure tenant_id filter)
@@ -427,26 +368,19 @@ const deleteProject = async (req, res) => {
       [projectId, tenantId]
     );
 
-    // BUSINESS RULE: Log all actions in audit_logs
-    await logAuditEvent(
-      client, userId, tenantId, `delete_project: ${project.name}`, 'project', projectId,
-      req.ip || req.connection.remoteAddress
-    );
+    // Log audit trail
+    await logAudit(tenantId, userId, 'DELETE', 'project', projectId, {
+      deletedProjectName: project.name
+    });
 
     await client.query('COMMIT');
 
-    res.status(200).json({
-      success: true,
-      message: 'Project deleted successfully'
-    });
+    return sendSuccess(res, 200, null, 'Project deleted successfully');
 
   } catch (error) {
     await client.query('ROLLBACK');
-    res.status(500).json({
-      success: false,
-      message: 'Failed to delete project',
-      error: error.message
-    });
+    console.error('Delete project error:', error);
+    return sendError(res, 500, 'Failed to delete project');
   } finally {
     client.release();
   }

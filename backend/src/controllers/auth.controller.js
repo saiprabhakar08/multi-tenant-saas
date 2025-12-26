@@ -2,6 +2,8 @@ const bcrypt = require('bcrypt');
 const { pool } = require('../config/db');
 const { generateToken } = require('../utils/jwt');
 const { v4: uuidv4 } = require('uuid');
+const logAudit = require('../utils/auditLogger');
+const { sendSuccess, sendError } = require('../utils/responseHelper');
 
 const registerTenant = async (req, res) => {
   const client = await pool.connect();
@@ -32,20 +34,15 @@ const registerTenant = async (req, res) => {
     
     await client.query('COMMIT');
     
-    res.status(201).json({
-      success: true,
-      message: 'Tenant registered successfully',
+    return sendSuccess(res, 201, {
       tenantId,
       userId
-    });
+    }, 'Tenant registered successfully');
     
   } catch (error) {
     await client.query('ROLLBACK');
-    res.status(400).json({
-      success: false,
-      message: 'Registration failed',
-      error: error.message
-    });
+    console.error('Registration error:', error);
+    return sendError(res, 400, 'Registration failed');
   } finally {
     client.release();
   }
@@ -53,90 +50,75 @@ const registerTenant = async (req, res) => {
 
 const login = async (req, res) => {
   try {
-    const { email, password, subdomain } = req.body;
+    const { email, password, tenantId } = req.body;
     
-    // Validate tenant by subdomain
-    const tenantQuery = await pool.query(
-      'SELECT id FROM tenants WHERE subdomain = $1 AND status = $2',
-      [subdomain, 'active']
-    );
-    
-    if (tenantQuery.rows.length === 0) {
-      return res.status(401).json({
-        success: false,
-        message: 'Invalid tenant'
-      });
-    }
-    
-    const tenantId = tenantQuery.rows[0].id;
-    
-    // Validate user
-    const userQuery = await pool.query(
-      `SELECT id, password_hash, role, full_name 
-       FROM users 
-       WHERE email = $1 AND tenant_id = $2 AND is_active = true`,
+    // Find user by email and tenantId
+    const userResult = await pool.query(
+      `SELECT u.id, u.tenant_id, u.email, u.password_hash, u.full_name, u.role, u.is_active,
+              t.name as tenant_name, t.subdomain, t.status as tenant_status
+       FROM users u
+       JOIN tenants t ON u.tenant_id = t.id
+       WHERE u.email = $1 AND u.tenant_id = $2`,
       [email, tenantId]
     );
     
-    if (userQuery.rows.length === 0) {
-      return res.status(401).json({
-        success: false,
-        message: 'Invalid credentials'
-      });
+    if (userResult.rows.length === 0) {
+      return sendError(res, 401, 'Invalid credentials');
     }
     
-    const user = userQuery.rows[0];
+    const user = userResult.rows[0];
     
-    // Compare password
-    const isValidPassword = await bcrypt.compare(password, user.password_hash);
-    
-    if (!isValidPassword) {
-      return res.status(401).json({
-        success: false,
-        message: 'Invalid credentials'
-      });
+    // Check if user is active
+    if (!user.is_active) {
+      return sendError(res, 401, 'Account is disabled');
     }
     
-    // Generate JWT
+    // Check if tenant is active
+    if (user.tenant_status !== 'active') {
+      return sendError(res, 401, 'Tenant account is suspended');
+    }
+    
+    // Verify password
+    const validPassword = await bcrypt.compare(password, user.password_hash);
+    if (!validPassword) {
+      return sendError(res, 401, 'Invalid credentials');
+    }
+    
+    // Generate JWT token
     const token = generateToken({
       userId: user.id,
-      tenantId: tenantId,
+      tenantId: user.tenant_id,
       role: user.role
     });
     
-    res.status(200).json({
-      success: true,
-      message: 'Login successful',
+    // Log audit trail
+    await logAudit(user.tenant_id, user.id, 'LOGIN', 'user', user.id, {
+      userEmail: user.email,
+      role: user.role
+    });
+    
+    return sendSuccess(res, 200, {
       token,
       user: {
         id: user.id,
-        email,
+        email: user.email,
         fullName: user.full_name,
         role: user.role,
-        tenantId
+        tenant: {
+          id: user.tenant_id,
+          name: user.tenant_name,
+          subdomain: user.subdomain
+        }
       }
-    });
+    }, 'Login successful');
     
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Login failed',
-      error: error.message
-    });
+    console.error('Login error:', error);
+    return sendError(res, 500, 'Internal server error');
   }
-};
-
-const me = async (req, res) => {
-  // TODO: Implement get current user
-};
-
-const logout = async (req, res) => {
-  // TODO: Implement user logout
 };
 
 module.exports = {
   registerTenant,
-  login,
-  me,
-  logout
+  login
 };

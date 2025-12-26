@@ -1,19 +1,8 @@
 const { pool } = require('../config/db');
 const bcrypt = require('bcrypt');
 const { v4: uuidv4 } = require('uuid');
-
-// Helper function to log updates to audit_logs
-const logAuditEvent = async (client, userId, tenantId, action, entityType, entityId, ipAddress) => {
-  try {
-    await client.query(
-      `INSERT INTO audit_logs (id, tenant_id, user_id, action, entity_type, entity_id, ip_address) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [uuidv4(), tenantId, userId, action, entityType, entityId, ipAddress]
-    );
-  } catch (error) {
-    console.error('Failed to log audit event:', error);
-  }
-};
+const logAudit = require('../utils/auditLogger');
+const { sendSuccess, sendError } = require('../utils/responseHelper');
 
 const addUser = async (req, res) => {
   const client = await pool.connect();
@@ -27,18 +16,12 @@ const addUser = async (req, res) => {
 
     // STRICT BUSINESS RULE: Only tenant_admin and super_admin can add users
     if (role !== 'tenant_admin' && role !== 'super_admin') {
-      return res.status(403).json({
-        success: false,
-        message: 'Access denied: Only tenant administrators and super administrators can add users'
-      });
+      return sendError(res, 403, 'Access denied: Only tenant administrators and super administrators can add users');
     }
 
     // TENANT ISOLATION: Non-super_admin must match tenantId
     if (role !== 'super_admin' && routeTenantId !== tenantId) {
-      return res.status(403).json({
-        success: false,
-        message: 'Access denied: Cannot add users to other tenants'
-      });
+      return sendError(res, 403, 'Access denied: Cannot add users to other tenants');
     }
 
     // Use the target tenant from route (super_admin) or user's tenant (tenant_admin)
@@ -52,10 +35,7 @@ const addUser = async (req, res) => {
 
     if (tenantQuery.rows.length === 0) {
       await client.query('ROLLBACK');
-      return res.status(404).json({
-        success: false,
-        message: 'Tenant not found'
-      });
+      return sendError(res, 404, 'Tenant not found');
     }
 
     const maxUsers = tenantQuery.rows[0].max_users;
@@ -66,14 +46,11 @@ const addUser = async (req, res) => {
       [targetTenantId]
     );
 
-    const currentUserCount = parseInt(userCountQuery.rows[0].count);
-
-    if (currentUserCount >= maxUsers) {
+    const currentCount = parseInt(userCountQuery.rows[0].count);
+    
+    if (currentCount >= maxUsers) {
       await client.query('ROLLBACK');
-      return res.status(400).json({
-        success: false,
-        message: `Cannot add user: Subscription limit reached (${maxUsers} users maximum)`
-      });
+      return sendError(res, 400, `Cannot add user: Subscription limit reached (${maxUsers} users maximum)`);
     }
 
     // Check if email already exists in this tenant
@@ -84,10 +61,7 @@ const addUser = async (req, res) => {
 
     if (existingUser.rows.length > 0) {
       await client.query('ROLLBACK');
-      return res.status(409).json({
-        success: false,
-        message: 'Email already exists in this tenant'
-      });
+      return sendError(res, 409, 'Email already exists in this tenant');
     }
 
     // Hash password
@@ -102,27 +76,31 @@ const addUser = async (req, res) => {
       [newUserId, targetTenantId, email, passwordHash, fullName, userRole, true]
     );
 
-    // Log audit event
-    await logAuditEvent(
-      client, userId, tenantId, 'add_user', 'user', newUserId,
-      req.ip || req.connection.remoteAddress
-    );
+    // Log the audit trail
+    await logAudit(targetTenantId, userId, 'CREATE', 'user', newUserId, {
+      userEmail: email,
+      userRole,
+      adminRole: role
+    });
 
     await client.query('COMMIT');
 
-    res.status(201).json({
-      success: true,
-      message: 'User created successfully',
-      data: result.rows[0]
-    });
+    const newUser = result.rows[0];
+    return sendSuccess(res, 201, {
+      user: {
+        id: newUser.id,
+        email: newUser.email,
+        fullName: newUser.full_name,
+        role: newUser.role,
+        isActive: newUser.is_active,
+        createdAt: newUser.created_at
+      }
+    }, 'User created successfully');
 
   } catch (error) {
     await client.query('ROLLBACK');
-    res.status(500).json({
-      success: false,
-      message: 'Failed to create user',
-      error: error.message
-    });
+    console.error('Add user error:', error);
+    return sendError(res, 500, 'Internal server error');
   } finally {
     client.release();
   }
@@ -135,178 +113,163 @@ const listUsers = async (req, res) => {
 
     // STRICT BUSINESS RULE: Only tenant_admin and super_admin can list users
     if (role !== 'tenant_admin' && role !== 'super_admin') {
-      return res.status(403).json({
-        success: false,
-        message: 'Access denied: Only tenant administrators and super administrators can list users'
-      });
+      return sendError(res, 403, 'Access denied: Only tenant administrators and super administrators can list users');
     }
 
     // TENANT ISOLATION: Non-super_admin must match tenantId
     if (role !== 'super_admin' && routeTenantId !== tenantId) {
-      return res.status(403).json({
-        success: false,
-        message: 'Access denied: Cannot list users from other tenants'
-      });
+      return sendError(res, 403, 'Access denied: Cannot list users from other tenants');
     }
 
-    const client = await pool.connect();
+    // Use the target tenant from route (super_admin) or user's tenant (tenant_admin)
+    const targetTenantId = routeTenantId;
 
-    try {
-      // Use the target tenant from route
-      const targetTenantId = routeTenantId;
-      
-      const query = `
-        SELECT id, email, full_name, role, is_active, created_at, updated_at
-        FROM users 
-        WHERE tenant_id = $1
-        ORDER BY created_at DESC
-      `;
-      
-      const result = await client.query(query, [targetTenantId]);
+    // Query users in the tenant
+    const result = await pool.query(
+      `SELECT id, email, full_name, role, is_active, created_at, updated_at 
+       FROM users 
+       WHERE tenant_id = $1 
+       ORDER BY created_at DESC`,
+      [targetTenantId]
+    );
 
-      // Log audit event
-      await logAuditEvent(
-        client, userId, tenantId, 'list_users', 'user', null,
-        req.ip || req.connection.remoteAddress
-      );
+    // Log the audit trail
+    await logAudit(targetTenantId, userId, 'READ', 'user_list', null, {
+      userCount: result.rows.length,
+      adminRole: role
+    });
 
-      res.status(200).json({
-        success: true,
-        data: result.rows,
-        count: result.rows.length
-      });
+    const users = result.rows.map(user => ({
+      id: user.id,
+      email: user.email,
+      fullName: user.full_name,
+      role: user.role,
+      isActive: user.is_active,
+      createdAt: user.created_at,
+      updatedAt: user.updated_at
+    }));
 
-    } finally {
-      client.release();
-    }
+    return sendSuccess(res, 200, {
+      users,
+      count: users.length
+    });
 
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Failed to list users',
-      error: error.message
-    });
+    console.error('List users error:', error);
+    return sendError(res, 500, 'Internal server error');
   }
 };
 
 const updateUser = async (req, res) => {
   const client = await pool.connect();
-
+  
   try {
     await client.query('BEGIN');
-
-    const { userId: targetUserId } = req.params;
-    const { role, tenantId, userId } = req.user;
+    
+    const { role, tenantId, userId: requestUserId } = req.user;
+    const { tenantId: routeTenantId, userId } = req.params;
     const { fullName, userRole, isActive } = req.body;
 
-    // Get target user to verify tenant access
-    const targetUserQuery = await client.query(
-      'SELECT tenant_id, role FROM users WHERE id = $1',
-      [targetUserId]
+    // Get the target user first
+    const userQuery = await client.query(
+      'SELECT * FROM users WHERE id = $1',
+      [userId]
     );
 
-    if (targetUserQuery.rows.length === 0) {
+    if (userQuery.rows.length === 0) {
       await client.query('ROLLBACK');
-      return res.status(404).json({
-        success: false,
-        message: 'User not found'
-      });
+      return sendError(res, 404, 'User not found');
     }
 
-    const targetUserTenantId = targetUserQuery.rows[0].tenant_id;
+    const targetUser = userQuery.rows[0];
 
-    // TENANT ISOLATION: Non-super_admin must match tenantId
-    if (role !== 'super_admin' && targetUserTenantId !== tenantId) {
-      await client.query('ROLLBACK');
-      return res.status(403).json({
-        success: false,
-        message: 'Access denied: Cannot update users in other tenants'
-      });
-    }
-
-    // STRICT BUSINESS RULES for updates
-    if (targetUserId === userId) {
-      // Users can only update their own fullName
-      if (role !== 'tenant_admin' && role !== 'super_admin' && (userRole !== undefined || isActive !== undefined)) {
-        await client.query('ROLLBACK');
-        return res.status(403).json({
-          success: false,
-          message: 'Access denied: Users can only update their own full name'
-        });
+    // STRICT BUSINESS RULE: Users can only update their own profiles, 
+    // tenant_admin can update users in their tenant, super_admin can update anyone
+    if (role === 'user') {
+      if (userId !== requestUserId) {
+        return sendError(res, 403, 'Access denied: Users can only update their own profiles');
       }
-    } else {
-      // Only tenant_admin and super_admin can update other users' role/isActive
-      if (role !== 'tenant_admin' && role !== 'super_admin') {
-        await client.query('ROLLBACK');
-        return res.status(403).json({
-          success: false,
-          message: 'Access denied: Only tenant administrators and super administrators can update user roles and status'
-        });
+    } else if (role === 'tenant_admin') {
+      // tenant_admin can only update users in their own tenant
+      if (targetUser.tenant_id !== tenantId) {
+        return sendError(res, 403, 'Access denied: Cannot update users from other tenants');
+      }
+      // tenant_admin cannot modify other tenant_admin or super_admin users
+      if (targetUser.role === 'tenant_admin' || targetUser.role === 'super_admin') {
+        return sendError(res, 403, 'Access denied: Cannot modify administrator accounts');
       }
     }
+    // super_admin can update anyone (no additional restrictions)
 
+    // TENANT ISOLATION: Verify the route tenant matches the user's tenant
+    if (role !== 'super_admin' && routeTenantId !== targetUser.tenant_id) {
+      await client.query('ROLLBACK');
+      return sendError(res, 400, 'Invalid route: User does not belong to the specified tenant');
+    }
+
+    // Build update query dynamically
     const updates = [];
     const values = [];
-    let paramCount = 1;
+    let valueIndex = 1;
 
-    if (fullName) {
-      updates.push(`full_name = $${paramCount++}`);
+    if (fullName !== undefined) {
+      updates.push(`full_name = $${valueIndex++}`);
       values.push(fullName);
     }
 
-    if (userRole) {
-      updates.push(`role = $${paramCount++}`);
-      values.push(userRole);
-    }
-
-    if (typeof isActive === 'boolean') {
-      updates.push(`is_active = $${paramCount++}`);
-      values.push(isActive);
+    // Only admins can change roles and active status
+    if (role === 'tenant_admin' || role === 'super_admin') {
+      if (userRole !== undefined) {
+        updates.push(`role = $${valueIndex++}`);
+        values.push(userRole);
+      }
+      
+      if (isActive !== undefined) {
+        updates.push(`is_active = $${valueIndex++}`);
+        values.push(isActive);
+      }
     }
 
     if (updates.length === 0) {
       await client.query('ROLLBACK');
-      return res.status(400).json({
-        success: false,
-        message: 'No valid fields to update'
-      });
+      return sendError(res, 400, 'No valid fields to update');
     }
 
-    updates.push(`updated_at = $${paramCount++}`);
-    values.push(new Date());
-    values.push(targetUserId);
+    updates.push(`updated_at = NOW()`);
+    values.push(userId);
 
-    const query = `
-      UPDATE users 
-      SET ${updates.join(', ')} 
-      WHERE id = $${paramCount}
-      RETURNING id, email, full_name, role, is_active, created_at, updated_at
-    `;
-
-    const result = await client.query(query, values);
-
-    // Log audit event
-    const updateDetails = Object.keys(req.body).join(', ');
-    await logAuditEvent(
-      client, userId, tenantId, `update_user: ${updateDetails}`, 'user', targetUserId,
-      req.ip || req.connection.remoteAddress
+    const result = await client.query(
+      `UPDATE users SET ${updates.join(', ')} 
+       WHERE id = $${valueIndex} 
+       RETURNING id, email, full_name, role, is_active, created_at, updated_at`,
+      values
     );
+
+    // Log the audit trail
+    await logAudit(targetUser.tenant_id, requestUserId, 'UPDATE', 'user', userId, {
+      updatedFields: { fullName, userRole, isActive },
+      adminRole: role
+    });
 
     await client.query('COMMIT');
 
-    res.status(200).json({
-      success: true,
-      message: 'User updated successfully',
-      data: result.rows[0]
-    });
+    const updatedUser = result.rows[0];
+    return sendSuccess(res, 200, {
+      user: {
+        id: updatedUser.id,
+        email: updatedUser.email,
+        fullName: updatedUser.full_name,
+        role: updatedUser.role,
+        isActive: updatedUser.is_active,
+        createdAt: updatedUser.created_at,
+        updatedAt: updatedUser.updated_at
+      }
+    }, 'User updated successfully');
 
   } catch (error) {
     await client.query('ROLLBACK');
-    res.status(500).json({
-      success: false,
-      message: 'Failed to update user',
-      error: error.message
-    });
+    console.error('Update user error:', error);
+    return sendError(res, 500, 'Internal server error');
   } finally {
     client.release();
   }
@@ -314,82 +277,62 @@ const updateUser = async (req, res) => {
 
 const deleteUser = async (req, res) => {
   const client = await pool.connect();
-
+  
   try {
     await client.query('BEGIN');
-
-    const { userId: targetUserId } = req.params;
-    const { role, tenantId, userId } = req.user;
+    
+    const { role, tenantId, userId: requestUserId } = req.user;
+    const { tenantId: routeTenantId, userId } = req.params;
 
     // STRICT BUSINESS RULE: Only tenant_admin and super_admin can delete users
     if (role !== 'tenant_admin' && role !== 'super_admin') {
-      return res.status(403).json({
-        success: false,
-        message: 'Access denied: Only tenant administrators and super administrators can delete users'
-      });
+      return sendError(res, 403, 'Access denied: Only administrators can delete users');
     }
 
-    // Get target user to verify tenant access
-    const targetUserQuery = await client.query(
-      'SELECT tenant_id, email FROM users WHERE id = $1',
-      [targetUserId]
+    // Get the target user first
+    const userQuery = await client.query(
+      'SELECT * FROM users WHERE id = $1',
+      [userId]
     );
 
-    if (targetUserQuery.rows.length === 0) {
+    if (userQuery.rows.length === 0) {
       await client.query('ROLLBACK');
-      return res.status(404).json({
-        success: false,
-        message: 'User not found'
-      });
+      return sendError(res, 404, 'User not found');
     }
 
-    const targetUserTenantId = targetUserQuery.rows[0].tenant_id;
-    const targetUserEmail = targetUserQuery.rows[0].email;
+    const targetUser = userQuery.rows[0];
 
     // TENANT ISOLATION: Non-super_admin must match tenantId
-    if (role !== 'super_admin' && targetUserTenantId !== tenantId) {
-      await client.query('ROLLBACK');
-      return res.status(403).json({
-        success: false,
-        message: 'Access denied: Cannot delete users in other tenants'
-      });
+    if (role !== 'super_admin' && targetUser.tenant_id !== tenantId) {
+      return sendError(res, 403, 'Access denied: Cannot delete users from other tenants');
     }
 
-    // STRICT BUSINESS RULE: tenant_admin cannot delete themselves
-    if (targetUserId === userId) {
+    // TENANT ISOLATION: Verify the route tenant matches the user's tenant
+    if (role !== 'super_admin' && routeTenantId !== targetUser.tenant_id) {
       await client.query('ROLLBACK');
-      return res.status(400).json({
-        success: false,
-        message: 'Access denied: Tenant administrators cannot delete themselves'
-      });
+      return sendError(res, 400, 'Invalid route: User does not belong to the specified tenant');
     }
 
-    // Delete user (soft delete by setting is_active = false)
+    // Soft delete the user (set is_active to false)
     await client.query(
-      'UPDATE users SET is_active = false, updated_at = $1 WHERE id = $2',
-      [new Date(), targetUserId]
+      'UPDATE users SET is_active = false, updated_at = NOW() WHERE id = $1',
+      [userId]
     );
 
-    // Log audit event
-    await logAuditEvent(
-      client, userId, tenantId, `delete_user: ${targetUserEmail}`, 'user', targetUserId,
-      req.ip || req.connection.remoteAddress
-    );
+    // Log the audit trail
+    await logAudit(targetUser.tenant_id, requestUserId, 'DELETE', 'user', userId, {
+      deletedUserEmail: targetUser.email,
+      adminRole: role
+    });
 
     await client.query('COMMIT');
 
-    res.status(200).json({
-      success: true,
-      message: 'User deactivated successfully'
-    });
+    return sendSuccess(res, 200, null, 'User deleted successfully');
 
   } catch (error) {
     await client.query('ROLLBACK');
-    res.status(500).json({
-      success: false,
-      message: 'Failed to delete user',
-      error: error.message
-    });
+    console.error('Delete user error:', error);
+    return sendError(res, 500, 'Internal server error');
   } finally {
     client.release();
   }

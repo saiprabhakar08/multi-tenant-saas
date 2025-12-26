@@ -4,6 +4,7 @@ require('dotenv').config();
 const { checkDbConnection } = require('./config/db');
 const runMigrations = require('./utils/runMigrations');
 const runSeeds = require('./utils/runSeeds');
+const { sendSuccess, sendError } = require('./utils/responseHelper');
 
 const app = express();
 
@@ -25,13 +26,10 @@ app.get('/api/health', async (req, res) => {
   const dbStatus = await checkDbConnection();
 
   if (!dbStatus) {
-    return res.status(500).json({
-      status: 'error',
-      database: 'disconnected'
-    });
+    return sendError(res, 500, 'Database connection failed', { database: 'disconnected' });
   }
 
-  res.status(200).json({
+  return sendSuccess(res, 200, {
     status: 'ok',
     database: 'connected'
   });

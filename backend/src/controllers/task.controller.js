@@ -1,18 +1,7 @@
 const { pool } = require('../config/db');
 const { v4: uuidv4 } = require('uuid');
-
-// Helper function to log updates to audit_logs
-const logAuditEvent = async (client, userId, tenantId, action, entityType, entityId, ipAddress) => {
-  try {
-    await client.query(
-      `INSERT INTO audit_logs (id, tenant_id, user_id, action, entity_type, entity_id, ip_address) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [uuidv4(), tenantId, userId, action, entityType, entityId, ipAddress]
-    );
-  } catch (error) {
-    console.error('Failed to log audit event:', error);
-  }
-};
+const logAudit = require('../utils/auditLogger');
+const { sendSuccess, sendError } = require('../utils/responseHelper');
 
 const createTask = async (req, res) => {
   const client = await pool.connect();
@@ -28,10 +17,7 @@ const createTask = async (req, res) => {
     // Basic validation
     if (!projectId || !title || title.trim() === '') {
       await client.query('ROLLBACK');
-      return res.status(400).json({
-        success: false,
-        message: 'Project ID and task title are required'
-      });
+      return sendError(res, 400, 'Project ID and task title are required');
     }
 
     // CRITICAL BUSINESS RULE: Get tenant_id from project, NOT from JWT
@@ -42,79 +28,60 @@ const createTask = async (req, res) => {
 
     if (projectQuery.rows.length === 0) {
       await client.query('ROLLBACK');
-      return res.status(404).json({
-        success: false,
-        message: 'Project not found'
-      });
+      return sendError(res, 404, 'Project not found');
     }
 
     const project = projectQuery.rows[0];
-    const projectTenantId = project.tenant_id; // Use project's tenant_id, NOT JWT tenantId
+    const effectiveTenantId = project.tenant_id; // Use project's tenant_id
 
-    // CRITICAL BUSINESS RULE: Verify project belongs to user's tenant
-    if (projectTenantId !== userTenantId) {
+    // CRITICAL SECURITY: Verify that user's JWT tenant matches project tenant
+    if (userTenantId !== effectiveTenantId) {
       await client.query('ROLLBACK');
-      return res.status(403).json({
-        success: false,
-        message: 'Access denied: Project does not belong to your tenant'
-      });
+      return sendError(res, 403, 'Access denied: Cannot create tasks in projects from other tenants');
     }
 
-    // CRITICAL BUSINESS RULE: Verify assignedTo user belongs to same tenant (if provided)
+    // Validate assignedTo user exists and belongs to same tenant
     if (assignedTo) {
       const assigneeQuery = await client.query(
-        'SELECT tenant_id FROM users WHERE id = $1',
-        [assignedTo]
+        'SELECT id FROM users WHERE id = $1 AND tenant_id = $2 AND is_active = true',
+        [assignedTo, effectiveTenantId]
       );
 
       if (assigneeQuery.rows.length === 0) {
         await client.query('ROLLBACK');
-        return res.status(404).json({
-          success: false,
-          message: 'Assigned user not found'
-        });
-      }
-
-      if (assigneeQuery.rows[0].tenant_id !== projectTenantId) {
-        await client.query('ROLLBACK');
-        return res.status(403).json({
-          success: false,
-          message: 'Access denied: Cannot assign task to user from different tenant'
-        });
+        return sendError(res, 400, 'Assigned user not found or not active in this tenant');
       }
     }
 
     const taskId = uuidv4();
 
-    // Create task using project's tenant_id
+    // Create task with tenant_id inherited from project
     const result = await client.query(
-      `INSERT INTO tasks (id, project_id, title, description, status, priority, assigned_to, created_by) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-       RETURNING id, project_id, title, description, status, priority, assigned_to, created_at, created_by`,
-      [taskId, projectId, title.trim(), description, status, priority, assignedTo, userId]
+      `INSERT INTO tasks (id, project_id, tenant_id, title, description, priority, status, assigned_to, created_by) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       RETURNING id, title, description, priority, status, assigned_to, created_at, created_by`,
+      [taskId, projectId, effectiveTenantId, title.trim(), description, priority, status, assignedTo, userId]
     );
 
-    // CRITICAL BUSINESS RULE: Log all CREATE actions in audit_logs
-    await logAuditEvent(
-      client, userId, projectTenantId, 'create_task', 'task', taskId,
-      req.ip || req.connection.remoteAddress
-    );
+    // Log audit trail using project's tenant_id
+    await logAudit(effectiveTenantId, userId, 'CREATE', 'task', taskId, {
+      taskTitle: title.trim(),
+      projectId,
+      priority,
+      status,
+      assignedTo
+    });
 
     await client.query('COMMIT');
 
-    res.status(201).json({
-      success: true,
-      message: 'Task created successfully',
-      data: result.rows[0]
-    });
+    return sendSuccess(res, 201, {
+      task: result.rows[0]
+    }, 'Task created successfully');
 
   } catch (error) {
     await client.query('ROLLBACK');
-    res.status(500).json({
-      success: false,
-      message: 'Failed to create task',
-      error: error.message
-    });
+    console.error('Create task error:', error);
+    return sendError(res, 500, 'Failed to create task');
   } finally {
     client.release();
   }
@@ -122,33 +89,30 @@ const createTask = async (req, res) => {
 
 const listProjectTasks = async (req, res) => {
   try {
+    // CRITICAL: Get tenantId from JWT for verification ONLY
     const { role, tenantId: userTenantId, userId } = req.user;
     const { projectId } = req.params;
-    const { status, priority, assignedTo, search, page = 1, limit = 10, sortBy = 'default' } = req.query;
+    const { status, priority, assignedTo, search, page = 1, limit = 10 } = req.query;
 
-    // Verify project belongs to user's tenant
     const client = await pool.connect();
 
     try {
+      // CRITICAL BUSINESS RULE: Get tenant_id from project, NOT from JWT
       const projectQuery = await client.query(
-        'SELECT tenant_id FROM projects WHERE id = $1',
+        'SELECT tenant_id, name FROM projects WHERE id = $1',
         [projectId]
       );
 
       if (projectQuery.rows.length === 0) {
-        return res.status(404).json({
-          success: false,
-          message: 'Project not found'
-        });
+        return sendError(res, 404, 'Project not found');
       }
 
-      const projectTenantId = projectQuery.rows[0].tenant_id;
+      const project = projectQuery.rows[0];
+      const effectiveTenantId = project.tenant_id;
 
-      if (projectTenantId !== userTenantId) {
-        return res.status(403).json({
-          success: false,
-          message: 'Access denied: Project does not belong to your tenant'
-        });
+      // CRITICAL SECURITY: Verify that user's JWT tenant matches project tenant
+      if (userTenantId !== effectiveTenantId) {
+        return sendError(res, 403, 'Access denied: Cannot access tasks from projects in other tenants');
       }
 
       // Validate pagination parameters
@@ -156,27 +120,19 @@ const listProjectTasks = async (req, res) => {
       const limitNum = Math.min(100, Math.max(1, parseInt(limit)));
       const offset = (pageNum - 1) * limitNum;
 
-      // Build query for tasks with enhanced filtering
+      // Build query with tenant_id verification
       let query = `
-        SELECT t.id, t.project_id, t.title, t.description, t.status, t.priority, t.due_date, t.created_at, t.updated_at,
-               creator.full_name as created_by_name, creator.email as created_by_email,
-               assignee.full_name as assigned_to_name, assignee.email as assigned_to_email,
-               p.name as project_name,
-               CASE 
-                 WHEN t.priority = 'high' THEN 3
-                 WHEN t.priority = 'medium' THEN 2
-                 WHEN t.priority = 'low' THEN 1
-                 ELSE 0
-               END as priority_order
+        SELECT t.id, t.title, t.description, t.priority, t.status, t.created_at, t.updated_at,
+               u1.full_name as created_by_name, u1.email as created_by_email,
+               u2.full_name as assigned_to_name, u2.email as assigned_to_email
         FROM tasks t
-        LEFT JOIN users creator ON t.created_by = creator.id
-        LEFT JOIN users assignee ON t.assigned_to = assignee.id
-        LEFT JOIN projects p ON t.project_id = p.id
-        WHERE t.project_id = $1
+        LEFT JOIN users u1 ON t.created_by = u1.id
+        LEFT JOIN users u2 ON t.assigned_to = u2.id
+        WHERE t.project_id = $1 AND t.tenant_id = $2
       `;
       
-      const values = [projectId];
-      let paramCount = 2;
+      const values = [projectId, effectiveTenantId];
+      let paramCount = 3;
 
       // Add filters
       if (status) {
@@ -194,21 +150,20 @@ const listProjectTasks = async (req, res) => {
         values.push(assignedTo);
       }
 
-      // Enhanced search (title only as requested)
       if (search) {
         query += ` AND t.title ILIKE $${paramCount++}`;
         values.push(`%${search}%`);
       }
 
-      // Get total count with same filters
+      // Get total count for pagination
       let countQuery = `
         SELECT COUNT(*) as total
         FROM tasks t
-        WHERE t.project_id = $1
+        WHERE t.project_id = $1 AND t.tenant_id = $2
       `;
       
-      const countValues = [projectId];
-      let countParamCount = 2;
+      const countValues = [projectId, effectiveTenantId];
+      let countParamCount = 3;
 
       if (status) {
         countQuery += ` AND t.status = $${countParamCount++}`;
@@ -234,48 +189,25 @@ const listProjectTasks = async (req, res) => {
       const totalItems = parseInt(countResult.rows[0].total);
       const totalPages = Math.ceil(totalItems / limitNum);
 
-      // Add sorting - priority DESC, due_date ASC as requested
-      let orderClause = '';
-      switch (sortBy) {
-        case 'priority':
-          orderClause = 'ORDER BY priority_order DESC, t.due_date ASC NULLS LAST, t.created_at DESC';
-          break;
-        case 'due_date':
-          orderClause = 'ORDER BY t.due_date ASC NULLS LAST, priority_order DESC, t.created_at DESC';
-          break;
-        case 'created':
-          orderClause = 'ORDER BY t.created_at DESC';
-          break;
-        case 'updated':
-          orderClause = 'ORDER BY t.updated_at DESC';
-          break;
-        case 'title':
-          orderClause = 'ORDER BY t.title ASC';
-          break;
-        case 'status':
-          orderClause = 'ORDER BY t.status ASC, priority_order DESC, t.due_date ASC NULLS LAST';
-          break;
-        case 'default':
-        default:
-          // Default order: priority DESC, due_date ASC
-          orderClause = 'ORDER BY priority_order DESC, t.due_date ASC NULLS LAST, t.created_at DESC';
-          break;
-      }
-
-      query += ` ${orderClause} LIMIT $${paramCount++} OFFSET $${paramCount++}`;
+      // Add sorting and pagination
+      query += ` ORDER BY t.created_at DESC LIMIT $${paramCount++} OFFSET $${paramCount++}`;
       values.push(limitNum, offset);
 
       const result = await client.query(query, values);
 
-      // Log audit event
-      await logAuditEvent(
-        client, userId, projectTenantId, 'list_tasks', 'task', null,
-        req.ip || req.connection.remoteAddress
-      );
+      // Log audit trail
+      await logAudit(effectiveTenantId, userId, 'READ', 'task_list', null, {
+        projectId,
+        filters: { status, priority, assignedTo, search },
+        taskCount: result.rows.length
+      });
 
-      res.status(200).json({
-        success: true,
-        data: result.rows,
+      return sendSuccess(res, 200, {
+        tasks: result.rows,
+        project: {
+          id: projectId,
+          name: project.name
+        },
         pagination: {
           currentPage: pageNum,
           totalPages: totalPages,
@@ -289,10 +221,6 @@ const listProjectTasks = async (req, res) => {
           priority: priority || null,
           assignedTo: assignedTo || null,
           search: search || null
-        },
-        sorting: {
-          sortBy: sortBy,
-          availableOptions: ['default', 'priority', 'due_date', 'created', 'updated', 'title', 'status']
         }
       });
 
@@ -301,11 +229,8 @@ const listProjectTasks = async (req, res) => {
     }
 
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Failed to list tasks',
-      error: error.message
-    });
+    console.error('List tasks error:', error);
+    return sendError(res, 500, 'Failed to list tasks');
   }
 };
 
@@ -315,80 +240,81 @@ const updateTaskStatus = async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    const { taskId } = req.params;
+    // CRITICAL: Get tenantId from JWT for verification ONLY
     const { role, tenantId: userTenantId, userId } = req.user;
+    const { projectId, taskId } = req.params;
     const { status } = req.body;
 
     if (!status) {
       await client.query('ROLLBACK');
-      return res.status(400).json({
-        success: false,
-        message: 'Status is required'
-      });
+      return sendError(res, 400, 'Status is required');
     }
 
-    // Get task and verify tenant through project
+    // CRITICAL BUSINESS RULE: Get tenant_id from project, NOT from JWT
+    const projectQuery = await client.query(
+      'SELECT tenant_id FROM projects WHERE id = $1',
+      [projectId]
+    );
+
+    if (projectQuery.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return sendError(res, 404, 'Project not found');
+    }
+
+    const effectiveTenantId = projectQuery.rows[0].tenant_id;
+
+    // CRITICAL SECURITY: Verify that user's JWT tenant matches project tenant
+    if (userTenantId !== effectiveTenantId) {
+      await client.query('ROLLBACK');
+      return sendError(res, 403, 'Access denied: Cannot update tasks in projects from other tenants');
+    }
+
+    // Get task to verify it belongs to the project and tenant
     const taskQuery = await client.query(
-      `SELECT t.id, t.project_id, p.tenant_id, t.title
-       FROM tasks t
-       JOIN projects p ON t.project_id = p.id
-       WHERE t.id = $1`,
-      [taskId]
+      'SELECT id, title, status as current_status, assigned_to FROM tasks WHERE id = $1 AND project_id = $2 AND tenant_id = $3',
+      [taskId, projectId, effectiveTenantId]
     );
 
     if (taskQuery.rows.length === 0) {
       await client.query('ROLLBACK');
-      return res.status(404).json({
-        success: false,
-        message: 'Task not found'
-      });
+      return sendError(res, 404, 'Task not found in this project');
     }
 
     const task = taskQuery.rows[0];
-    const taskTenantId = task.tenant_id;
 
-    // Verify task belongs to user's tenant
-    if (taskTenantId !== userTenantId) {
+    // BUSINESS RULE: Only assigned user, task creator, or tenant_admin can update task status
+    if (role !== 'tenant_admin' && task.assigned_to !== userId) {
       await client.query('ROLLBACK');
-      return res.status(403).json({
-        success: false,
-        message: 'Access denied: Task does not belong to your tenant'
-      });
+      return sendError(res, 403, 'Access denied: Only assigned user or tenant administrator can update task status');
     }
-
-    // CRITICAL BUSINESS RULE: Any tenant user can update task status
-    // No additional authorization checks needed beyond tenant verification
 
     // Update task status
     const result = await client.query(
       `UPDATE tasks 
-       SET status = $1, updated_at = $2 
-       WHERE id = $3
-       RETURNING id, project_id, title, description, status, priority, assigned_to, created_at, updated_at`,
-      [status, new Date(), taskId]
+       SET status = $1, updated_at = NOW() 
+       WHERE id = $2 AND project_id = $3 AND tenant_id = $4
+       RETURNING id, title, description, priority, status, assigned_to, created_at, updated_at`,
+      [status, taskId, projectId, effectiveTenantId]
     );
 
-    // CRITICAL BUSINESS RULE: Log all UPDATE actions in audit_logs
-    await logAuditEvent(
-      client, userId, taskTenantId, `update_task_status: ${status}`, 'task', taskId,
-      req.ip || req.connection.remoteAddress
-    );
+    // Log audit trail
+    await logAudit(effectiveTenantId, userId, 'UPDATE', 'task_status', taskId, {
+      taskTitle: task.title,
+      oldStatus: task.current_status,
+      newStatus: status,
+      projectId
+    });
 
     await client.query('COMMIT');
 
-    res.status(200).json({
-      success: true,
-      message: 'Task status updated successfully',
-      data: result.rows[0]
-    });
+    return sendSuccess(res, 200, {
+      task: result.rows[0]
+    }, 'Task status updated successfully');
 
   } catch (error) {
     await client.query('ROLLBACK');
-    res.status(500).json({
-      success: false,
-      message: 'Failed to update task status',
-      error: error.message
-    });
+    console.error('Update task status error:', error);
+    return sendError(res, 500, 'Failed to update task status');
   } finally {
     client.release();
   }
@@ -400,71 +326,68 @@ const updateTask = async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    const { taskId } = req.params;
+    // CRITICAL: Get tenantId from JWT for verification ONLY
     const { role, tenantId: userTenantId, userId } = req.user;
+    const { projectId, taskId } = req.params;
     const { title, description, priority, status, assignedTo } = req.body;
 
-    // Get task and verify tenant through project
+    // CRITICAL BUSINESS RULE: Get tenant_id from project, NOT from JWT
+    const projectQuery = await client.query(
+      'SELECT tenant_id FROM projects WHERE id = $1',
+      [projectId]
+    );
+
+    if (projectQuery.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return sendError(res, 404, 'Project not found');
+    }
+
+    const effectiveTenantId = projectQuery.rows[0].tenant_id;
+
+    // CRITICAL SECURITY: Verify that user's JWT tenant matches project tenant
+    if (userTenantId !== effectiveTenantId) {
+      await client.query('ROLLBACK');
+      return sendError(res, 403, 'Access denied: Cannot update tasks in projects from other tenants');
+    }
+
+    // Get task to verify it belongs to the project and tenant
     const taskQuery = await client.query(
-      `SELECT t.id, t.project_id, t.created_by, p.tenant_id, t.title
-       FROM tasks t
-       JOIN projects p ON t.project_id = p.id
-       WHERE t.id = $1`,
-      [taskId]
+      'SELECT id, title, created_by, assigned_to FROM tasks WHERE id = $1 AND project_id = $2 AND tenant_id = $3',
+      [taskId, projectId, effectiveTenantId]
     );
 
     if (taskQuery.rows.length === 0) {
       await client.query('ROLLBACK');
-      return res.status(404).json({
-        success: false,
-        message: 'Task not found'
-      });
+      return sendError(res, 404, 'Task not found in this project');
     }
 
     const task = taskQuery.rows[0];
-    const taskTenantId = task.tenant_id;
 
-    // Verify task belongs to user's tenant
-    if (taskTenantId !== userTenantId) {
+    // BUSINESS RULE: Only task creator, assigned user, or tenant_admin can update task
+    if (role !== 'tenant_admin' && task.created_by !== userId && task.assigned_to !== userId) {
       await client.query('ROLLBACK');
-      return res.status(403).json({
-        success: false,
-        message: 'Access denied: Task does not belong to your tenant'
-      });
+      return sendError(res, 403, 'Access denied: Only task creator, assigned user, or tenant administrator can update tasks');
     }
 
-    // Authorization: task creator, tenant_admin, or any user can update (more permissive than projects)
-    // Any authenticated user in the tenant can update tasks
-
-    // If assignedTo is being updated, verify the user belongs to same tenant
+    // Validate assignedTo user if provided
     if (assignedTo) {
       const assigneeQuery = await client.query(
-        'SELECT tenant_id FROM users WHERE id = $1',
-        [assignedTo]
+        'SELECT id FROM users WHERE id = $1 AND tenant_id = $2 AND is_active = true',
+        [assignedTo, effectiveTenantId]
       );
 
       if (assigneeQuery.rows.length === 0) {
         await client.query('ROLLBACK');
-        return res.status(404).json({
-          success: false,
-          message: 'Assigned user not found'
-        });
-      }
-
-      if (assigneeQuery.rows[0].tenant_id !== taskTenantId) {
-        await client.query('ROLLBACK');
-        return res.status(403).json({
-          success: false,
-          message: 'Access denied: Cannot assign task to user from different tenant'
-        });
+        return sendError(res, 400, 'Assigned user not found or not active in this tenant');
       }
     }
 
+    // Build update query dynamically
     const updates = [];
     const values = [];
     let paramCount = 1;
 
-    if (title && title.trim() !== '') {
+    if (title !== undefined && title.trim() !== '') {
       updates.push(`title = $${paramCount++}`);
       values.push(title.trim());
     }
@@ -474,12 +397,12 @@ const updateTask = async (req, res) => {
       values.push(description);
     }
 
-    if (priority) {
+    if (priority !== undefined) {
       updates.push(`priority = $${paramCount++}`);
       values.push(priority);
     }
 
-    if (status) {
+    if (status !== undefined) {
       updates.push(`status = $${paramCount++}`);
       values.push(status);
     }
@@ -491,47 +414,111 @@ const updateTask = async (req, res) => {
 
     if (updates.length === 0) {
       await client.query('ROLLBACK');
-      return res.status(400).json({
-        success: false,
-        message: 'No valid fields to update'
-      });
+      return sendError(res, 400, 'No valid fields to update');
     }
 
-    updates.push(`updated_at = $${paramCount++}`);
-    values.push(new Date());
-    values.push(taskId);
+    updates.push(`updated_at = NOW()`);
+    values.push(taskId, projectId, effectiveTenantId);
 
     const query = `
       UPDATE tasks 
       SET ${updates.join(', ')} 
-      WHERE id = $${paramCount}
-      RETURNING id, project_id, title, description, status, priority, assigned_to, created_at, updated_at
+      WHERE id = $${paramCount} AND project_id = $${paramCount + 1} AND tenant_id = $${paramCount + 2}
+      RETURNING id, title, description, priority, status, assigned_to, created_at, updated_at
     `;
 
     const result = await client.query(query, values);
 
-    // CRITICAL BUSINESS RULE: Log all UPDATE actions in audit_logs
-    const updateDetails = Object.keys(req.body).join(', ');
-    await logAuditEvent(
-      client, userId, taskTenantId, `update_task: ${updateDetails}`, 'task', taskId,
-      req.ip || req.connection.remoteAddress
-    );
+    // Log audit trail
+    await logAudit(effectiveTenantId, userId, 'UPDATE', 'task', taskId, {
+      taskTitle: task.title,
+      updatedFields: { title, description, priority, status, assignedTo },
+      projectId
+    });
 
     await client.query('COMMIT');
 
-    res.status(200).json({
-      success: true,
-      message: 'Task updated successfully',
-      data: result.rows[0]
-    });
+    return sendSuccess(res, 200, {
+      task: result.rows[0]
+    }, 'Task updated successfully');
 
   } catch (error) {
     await client.query('ROLLBACK');
-    res.status(500).json({
-      success: false,
-      message: 'Failed to update task',
-      error: error.message
+    console.error('Update task error:', error);
+    return sendError(res, 500, 'Failed to update task');
+  } finally {
+    client.release();
+  }
+};
+
+const deleteTask = async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    // CRITICAL: Get tenantId from JWT for verification ONLY
+    const { role, tenantId: userTenantId, userId } = req.user;
+    const { projectId, taskId } = req.params;
+
+    // CRITICAL BUSINESS RULE: Get tenant_id from project, NOT from JWT
+    const projectQuery = await client.query(
+      'SELECT tenant_id FROM projects WHERE id = $1',
+      [projectId]
+    );
+
+    if (projectQuery.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return sendError(res, 404, 'Project not found');
+    }
+
+    const effectiveTenantId = projectQuery.rows[0].tenant_id;
+
+    // CRITICAL SECURITY: Verify that user's JWT tenant matches project tenant
+    if (userTenantId !== effectiveTenantId) {
+      await client.query('ROLLBACK');
+      return sendError(res, 403, 'Access denied: Cannot delete tasks in projects from other tenants');
+    }
+
+    // Get task to verify it belongs to the project and tenant
+    const taskQuery = await client.query(
+      'SELECT id, title, created_by FROM tasks WHERE id = $1 AND project_id = $2 AND tenant_id = $3',
+      [taskId, projectId, effectiveTenantId]
+    );
+
+    if (taskQuery.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return sendError(res, 404, 'Task not found in this project');
+    }
+
+    const task = taskQuery.rows[0];
+
+    // BUSINESS RULE: Only task creator or tenant_admin can delete task
+    if (role !== 'tenant_admin' && task.created_by !== userId) {
+      await client.query('ROLLBACK');
+      return sendError(res, 403, 'Access denied: Only task creator or tenant administrator can delete tasks');
+    }
+
+    // Delete task
+    await client.query(
+      'DELETE FROM tasks WHERE id = $1 AND project_id = $2 AND tenant_id = $3',
+      [taskId, projectId, effectiveTenantId]
+    );
+
+    // Log audit trail
+    await logAudit(effectiveTenantId, userId, 'DELETE', 'task', taskId, {
+      deletedTaskTitle: task.title,
+      projectId
     });
+
+    await client.query('COMMIT');
+
+    return sendSuccess(res, 200, null, 'Task deleted successfully');
+
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Delete task error:', error);
+    return sendError(res, 500, 'Failed to delete task');
   } finally {
     client.release();
   }
@@ -541,5 +528,6 @@ module.exports = {
   createTask,
   listProjectTasks,
   updateTaskStatus,
-  updateTask
+  updateTask,
+  deleteTask
 };
