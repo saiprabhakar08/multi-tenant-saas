@@ -1,10 +1,12 @@
 import { useState, useEffect } from 'react';
 import { useAuth } from '../context/AuthContext';
+import { useNavigate } from 'react-router-dom';
 import api from '../services/api';
 import ProjectModal from '../components/ProjectModal';
 
 export default function Projects() {
   const { user } = useAuth();
+  const navigate = useNavigate();
   const [projects, setProjects] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -47,6 +49,10 @@ export default function Projects() {
     // Add new project to the list
     setProjects(prev => [newProject, ...prev]);
     alert('Project created successfully!');
+  };
+
+  const handleViewProject = (projectId) => {
+    navigate(`/projects/${projectId}`);
   };
 
   const handleDeleteProject = async (projectId, projectName) => {
@@ -251,24 +257,41 @@ export default function Projects() {
                 Created: {new Date(project.created_at).toLocaleDateString()}
               </div>
               
-              {canDeleteProject(project) && (
+              {/* Action Buttons */}
+              <div style={{ display: 'flex', gap: '10px', flexDirection: 'column' }}>
                 <button
-                  onClick={() => handleDeleteProject(project.id, project.name)}
-                  disabled={deleteLoading[project.id]}
+                  onClick={() => handleViewProject(project.id)}
                   style={{
                     padding: '8px 16px',
-                    backgroundColor: deleteLoading[project.id] ? '#ccc' : '#dc3545',
+                    backgroundColor: '#007bff',
                     color: 'white',
                     border: 'none',
                     borderRadius: '4px',
-                    cursor: deleteLoading[project.id] ? 'not-allowed' : 'pointer',
-                    fontSize: '14px',
-                    width: '100%'
+                    cursor: 'pointer',
+                    fontSize: '14px'
                   }}
                 >
-                  {deleteLoading[project.id] ? 'Deleting...' : 'Delete Project'}
+                  View Details
                 </button>
-              )}
+                
+                {canDeleteProject(project) && (
+                  <button
+                    onClick={() => handleDeleteProject(project.id, project.name)}
+                    disabled={deleteLoading[project.id]}
+                    style={{
+                      padding: '8px 16px',
+                      backgroundColor: deleteLoading[project.id] ? '#ccc' : '#dc3545',
+                      color: 'white',
+                      border: 'none',
+                      borderRadius: '4px',
+                      cursor: deleteLoading[project.id] ? 'not-allowed' : 'pointer',
+                      fontSize: '14px'
+                    }}
+                  >
+                    {deleteLoading[project.id] ? 'Deleting...' : 'Delete Project'}
+                  </button>
+                )}
+              </div>
             </div>
           ))}
         </div>
