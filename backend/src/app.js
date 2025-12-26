@@ -2,6 +2,8 @@ const express = require('express');
 const cors = require('cors');
 require('dotenv').config();
 const { checkDbConnection } = require('./config/db');
+const runMigrations = require('./utils/runMigrations');
+const runSeeds = require('./utils/runSeeds');
 
 const app = express();
 
@@ -27,6 +29,17 @@ app.get('/api/health', async (req, res) => {
     database: 'connected'
   });
 });
+
+(async () => {
+  try {
+    await runMigrations();
+    await runSeeds();
+    console.log('Migrations & seeds completed');
+  } catch (err) {
+    console.error('DB init failed:', err);
+    process.exit(1);
+  }
+})();
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
