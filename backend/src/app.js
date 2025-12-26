@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 require('dotenv').config();
+const { checkDbConnection } = require('./config/db');
 
 const app = express();
 
@@ -12,9 +13,18 @@ app.use(cors({
 app.use(express.json());
 
 app.get('/api/health', async (req, res) => {
+  const dbStatus = await checkDbConnection();
+
+  if (!dbStatus) {
+    return res.status(500).json({
+      status: 'error',
+      database: 'disconnected'
+    });
+  }
+
   res.status(200).json({
     status: 'ok',
-    database: 'pending'
+    database: 'connected'
   });
 });
 
